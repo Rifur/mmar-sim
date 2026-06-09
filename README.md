@@ -62,7 +62,19 @@ uv run real_fractal_sim.py TICKER [options]
 
 ### Option A — Open in Colab (recommended)
 
-Click the badge at the top of this README, then run all cells.
+[![Open in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/Rifur/mmar-sim/blob/main/mmar_colab.ipynb)
+
+1. Click the badge above (or the one at the top of this README)
+2. **Runtime → Run all**
+3. Edit `TICKER` in Step 2, or use the interactive form in Step 3
+
+Minimal usage inside the notebook:
+
+```python
+from real_fractal_sim_colab import run_colab
+result = run_colab("6919.TW", n_steps=20, n_sims=10000)
+print(result["fit"]["score"])
+```
 
 ### Option B — Clone inside a notebook
 
