@@ -2158,17 +2158,38 @@ def run_colab(
         enforce_left_tail=enforce_left_tail,
     )
     stats = print_results(data, currency)
-    mmar_path = os.path.join(out_dir, f"{tag}_mmar.png")
-    plot_results(data, stats, currency, mmar_path, show_inline=show_plots)
     fit = validate_simulation_fit(data)
     print_fit_validation(fit, data["end_label"], data["n_steps"],
                          recent_vol_63=data.get("recent_vol_63", 0.0),
                          recent_vol_22=data.get("recent_vol_22", 0.0))
+
+    mmar_path = os.path.join(out_dir, f"{tag}_mmar.png")
     gof_path = os.path.join(out_dir, f"{tag}_mmar_gof.png")
+    if show_plots:
+        print(f"\n{'='*58}")
+        print("  Charts")
+        print(f"{'='*58}")
+    plot_results(data, stats, currency, mmar_path, show_inline=show_plots)
     plot_fit_validation(fit, data, gof_path, show_inline=show_plots)
     return dict(data=data, stats=stats, fit=fit,
                 mmar_path=mmar_path, gof_path=gof_path,
                 currency=currency)
+
+
+def display_charts(result: dict) -> None:
+    """Show saved chart PNGs inline (Jupyter / Colab)."""
+    try:
+        from IPython.display import Image, display
+    except ImportError:
+        print(f"MMAR chart: {result.get('mmar_path', '')}")
+        print(f"GOF chart:  {result.get('gof_path', '')}")
+        return
+    for label, key in [("MMAR simulation", "mmar_path"),
+                       ("Goodness of fit", "gof_path")]:
+        path = result.get(key)
+        if path and os.path.isfile(path):
+            print(f"\n--- {label} ---")
+            display(Image(filename=path))
 
 
 def print_report(result: dict) -> None:
