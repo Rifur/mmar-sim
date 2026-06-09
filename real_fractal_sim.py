@@ -89,6 +89,13 @@ except ImportError:
 OUTPUT_DIR = "/content/output" if IN_COLAB else "output"
 
 
+def print_disclaimer() -> None:
+    """Print a short legal disclaimer before simulation output."""
+    print("【免責聲明】本程式僅供研究／教育之量化風險情境模擬，不構成投資建議。")
+    print("  模擬依歷史資料與模型假設，過去分布不代表未來；投資有風險，請自行判斷。")
+    print("  詳見 DISCLAIMER.md")
+
+
 def _colab_install_deps() -> None:
     import importlib.util
     import subprocess
@@ -2142,6 +2149,7 @@ def run_colab(
             raise ValueError(f"Cannot download latest price for {ticker}")
         sim_start = str(tmp.index[-1].date())
 
+    print_disclaimer()
     print(f"\n{'='*58}")
     print(f"  MMAR simulation (Colab): {ticker}")
     print(f"  Market: {market}  |  Start: {sim_start}  |  Paths: {n_sims:,}")
@@ -2258,6 +2266,7 @@ def main():
         tmp = yf.download(ticker, period="5d", progress=False)
         sim_start = str(tmp.index[-1].date())
 
+    print_disclaimer()
     print(f"\n{'='*58}")
     print(f"  MMAR 碎形模擬（忠於曼德博原典）：{ticker}")
     print(f"  市場指數：{market}  |  貨幣：{currency}")

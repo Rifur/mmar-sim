@@ -4,7 +4,12 @@
 
 **MMAR multifractal market simulator** — Monte Carlo price paths with heavy tails, volatility clustering, long memory, goodness-of-fit validation, and risk scenario tables for Taiwan & US equities.
 
-> **Disclaimer:** Research and education tool only. **Not investment advice.** Past distributions do not predict future returns. Simulation includes empirical post-processing (body/tail calibration) beyond pure theoretical MMAR.
+## Disclaimer / 免責聲明
+
+**Research and education only — not investment advice.**  
+本工具僅供研究與教育，**不構成投資建議**；模擬結果為假設性情境，過去分布不代表未來報酬。
+
+See **[DISCLAIMER.md](DISCLAIMER.md)** for the full text (中文 / English).
 
 ## Features
 
@@ -123,6 +128,7 @@ mmar-sim/
 ├── real_fractal_sim_colab.py # Compatibility shim
 ├── mmar_colab.ipynb          # Colab notebook
 ├── pyproject.toml
+├── DISCLAIMER.md
 └── README.md
 ```
 
@@ -136,4 +142,4 @@ mmar-sim/
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT — see [LICENSE](LICENSE). Use of this software is subject to [DISCLAIMER.md](DISCLAIMER.md).
