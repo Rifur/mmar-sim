@@ -2167,7 +2167,21 @@ def run_colab(
     gof_path = os.path.join(out_dir, f"{tag}_mmar_gof.png")
     plot_fit_validation(fit, data, gof_path, show_inline=show_plots)
     return dict(data=data, stats=stats, fit=fit,
-                mmar_path=mmar_path, gof_path=gof_path)
+                mmar_path=mmar_path, gof_path=gof_path,
+                currency=currency)
+
+
+def print_report(result: dict) -> None:
+    """Re-print the full text report (same as run_colab stdout)."""
+    d = result["data"]
+    fit = result["fit"]
+    currency = result.get("currency") or detect_market(d["ticker"])["currency"]
+    print_results(d, currency)
+    print_fit_validation(
+        fit, d["end_label"], d["n_steps"],
+        recent_vol_63=d.get("recent_vol_63", 0.0),
+        recent_vol_22=d.get("recent_vol_22", 0.0),
+    )
 
 
 # ══════════════════════════════════════════════════════════════
