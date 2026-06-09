@@ -72,7 +72,7 @@ Minimal usage inside the notebook:
 
 ```python
 from real_fractal_sim_colab import run_colab
-result = run_colab("6919.TW", n_steps=20, n_sims=10000)
+result = run_colab("2330.TW", n_steps=20, n_sims=10000)
 print(result["fit"]["score"])
 ```
 
