@@ -101,17 +101,6 @@ from real_fractal_sim import run_colab
 run_colab("NVDA", n_sims=3000)
 ```
 
-## 0050 batch scan (Taiwan)
-
-Scan all Taiwan 50 index constituents and rank by GOF score:
-
-```bash
-uv run batch_0050_scan.py --sims 3000
-uv run batch_0050_scan.py --codes 2330,2454,3711 --sims 2000
-```
-
-Writes `output/0050_scan_YYYYMMDD/` with per-stock reports and `summary.csv`.
-
 ## Model overview
 
 ```
@@ -133,7 +122,6 @@ mmar-sim/
 ├── real_fractal_sim.py       # Core module, CLI, run_colab()
 ├── real_fractal_sim_colab.py # Compatibility shim
 ├── mmar_colab.ipynb          # Colab notebook
-├── batch_0050_scan.py        # 0050 constituent batch scanner
 ├── pyproject.toml
 └── README.md
 ```
