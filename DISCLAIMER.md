@@ -13,7 +13,7 @@
 
 ### 您應了解
 
-1. **模型限制**：MMAR 模擬含理論生成器與歷史資料校準（主體／左尾錨定等），結果為**假設情境**，與實際市場可能顯著偏離。
+1. **模型限制**：MMAR 模擬含理論生成器與歷史資料校準（主體／左尾錨定等），結果為**假設情境**，與實際市場可能顯著偏離。本軟體**不保證**模型、參數估計、統計推論、模擬結果或風險指標之**正確性、完整性、適用性或即時性**。
 2. **資料限制**：價格來自第三方（如 Yahoo Finance），可能有延遲、錯誤、分割／配息調整問題；**市場微結構**（market microstructure）亦影響尾部估計與模擬結果。
 3. **非預測工具**：歷史分布吻合度（GOF）僅衡量「模擬與過去資料之統計相似度」，**不代表**未來報酬或價格預測能力。
 4. **歷史不代表未來**：**歷史績效、歷史分布擬合結果或回測結果，不代表未來市場表現。**
@@ -47,7 +47,7 @@
 
 ### You should understand
 
-1. **Model limits**: Simulations combine MMAR-style generators with empirical calibration; outputs are **hypothetical scenarios**, not forecasts.
+1. **Model limits**: Simulations combine MMAR-style generators with empirical calibration; outputs are **hypothetical, illustrative, and subject to model risk**, and may diverge materially from actual markets. This software **does not warrant** the **accuracy, completeness, fitness for purpose, or timeliness** of its models, parameter estimates, statistical inference, simulation results, or risk metrics.
 2. **Data limits**: Market data may be delayed, incomplete, or revised; **market microstructure** affects tail behavior and simulation results.
 3. **Not predictive**: Goodness-of-fit measures historical statistical similarity only; it does **not** imply future performance.
 4. **Past is not prologue**: **Historical performance, historical distribution fit, or backtest results do not represent future market performance.**
