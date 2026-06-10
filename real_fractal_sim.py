@@ -154,7 +154,7 @@ _STRESS_TAIL_WEIGHT = 0.40   # 左尾分位數混入壓力池權重
 _FULL_TAIL_WEIGHT = 0.25     # 左尾分位數混入全樣本權重
 _BODY_KNOT_PCTS  = [1, 5, 10, 25, 50, 75, 90, 95, 99]  # 主體+左尾節點
 _LEFT_TAIL_BLEND = 0.90      # P1/P5 硬錨左尾
-_RIGHT_TAIL_BLEND = 0.35     # P95/P99 軟錨右尾（保留 MMAR 重尾）
+_RIGHT_TAIL_BLEND = 0.80     # P95/P99 硬錨右尾（對稱左尾，抑制 MMAR 右尾膨脹）
 _TAIL_BLEND      = _RIGHT_TAIL_BLEND  # 相容舊參數名
 
 
@@ -169,9 +169,423 @@ MARKET_PRESETS = {
 }
 
 def detect_market(ticker: str) -> dict:
-    if ticker.endswith(".TW") or ticker.endswith(".TWO"):
+    if ticker.endswith(".TW") or ticker.endswith(".TWO") or ticker == "^TWII":
         return MARKET_PRESETS["TW"]
     return MARKET_PRESETS["US"]
+
+
+# ── 歷史 Black Swan 壓力事件目錄 ────────────────────────────────
+# log_return：事件累積對數報酬（負值=崩跌）
+# duration  ：持續交易日數
+
+_STRESS_CATALOG: dict[str, list] = {
+    "TW": [
+        {"name": "1990 台股崩盤",      "log_return": -1.609, "duration": 200},  # -80%
+        {"name": "1997 亞洲金融危機",  "log_return": -0.598, "duration": 120},  # -45%
+        {"name": "2000 科技泡沫",      "log_return": -0.916, "duration": 200},  # -60%
+        {"name": "2008 金融海嘯",      "log_return": -0.844, "duration": 200},  # -57%
+        {"name": "2020 COVID",         "log_return": -0.329, "duration": 20 },  # -28%
+        {"name": "2022 升息衝擊",      "log_return": -0.357, "duration": 200},  # -30%
+    ],
+    "US": [
+        {"name": "1987 Black Monday",  "log_return": -0.291, "duration": 3  },  # -25% acute
+        {"name": "2000-2002 科技泡沫", "log_return": -0.673, "duration": 500},  # -49%
+        {"name": "2008 金融海嘯",      "log_return": -0.844, "duration": 300},  # -57%
+        {"name": "2020 COVID",         "log_return": -0.416, "duration": 23 },  # -34%
+        {"name": "2022 升息衝擊",      "log_return": -0.288, "duration": 200},  # -25%
+    ],
+}
+
+_STRESS_FREQ_LIST = [0.001, 0.005, 0.01, 0.05, 0.10]
+
+
+# ── 體制混合（Regime Mixture）Dirichlet 先驗 ─────────────────────
+# 濃度向量 α：E[w] = α/sum(α) = [70%, 20%, 10%]
+# 向量越小 → 權重分散度越大 → 更深的 regime uncertainty
+# 用 [7,2,1] 而非 [70,20,10]：保留合理的批次間變異
+
+_REGIME_DIRICHLET = [7.0, 2.0, 1.0]   # normal / stress / crisis
+
+_REGIME_PARAMS = [
+    {"name": "normal", "alpha_mult": 1.00, "H_boost": 0.00, "lam2_mult": 1.00},
+    {"name": "stress", "alpha_mult": 0.85, "H_boost": 0.10, "lam2_mult": 1.25},
+    {"name": "crisis", "alpha_mult": 0.70, "H_boost": 0.25, "lam2_mult": 1.60},
+]
+
+
+def _split_regime_counts(n_batch: int, weights: np.ndarray) -> list[int]:
+    """Dirichlet 權重 → 整數路徑數（保證總和 = n_batch）。"""
+    counts = [int(w * n_batch) for w in weights]
+    counts[-1] = n_batch - sum(counts[:-1])   # 尾項吸收捨入誤差
+    return counts
+
+
+def _inject_stress_into_paths(
+    all_paths: np.ndarray,
+    n_steps: int,
+    events: list,
+    n_inject: int,
+    rng: np.random.Generator,
+) -> np.ndarray:
+    """n_inject 條隨機路徑中注入歷史壓力事件，繞過 levy_cap 上限。
+
+    注入機制：在隨機時間點 t0 開始，對數報酬線性爬坡至 event['log_return']，
+    t0+duration 後路徑繼續正常 MMAR 演化（已偏移的水準繼續）。
+    """
+    out = all_paths.copy()
+    n_paths = all_paths.shape[1]
+    idxs = rng.choice(n_paths, size=min(n_inject, n_paths), replace=False)
+    steps = np.arange(n_steps + 1, dtype=float)
+
+    for idx in idxs:
+        ev = events[int(rng.integers(len(events)))]
+        dur = min(ev["duration"], n_steps - 1)
+        t0 = int(rng.integers(1, max(2, n_steps - dur + 1)))
+        log_ret = float(ev["log_return"])
+        daily_log = log_ret / dur
+
+        # 線性 log-scale 爬坡：[t0+1, t0+dur] 區間逐日累積，之後固定偏移
+        log_scale = np.where(
+            steps < t0 + 1, 0.0,
+            np.where(steps <= t0 + dur,
+                     (steps - t0) * daily_log,
+                     log_ret)
+        )
+        out[:, idx] *= np.exp(log_scale)
+
+    return out
+
+
+def simulate_hist_bootstrap(
+    r_s: np.ndarray,
+    n_steps: int,
+    n_sims: int,
+    last_price: float,
+    seed: int = 6,
+) -> np.ndarray:
+    """歷史 Bootstrap：有放回重抽 n_steps 長度的滾動視窗。
+
+    無模型假設——純粹的非參數經驗分布。
+    當 MMAR 和 Student-t 一起出錯時，這是獨立的第三視角。
+    """
+    rng   = np.random.default_rng(seed)
+    r     = np.asarray(r_s, dtype=float)
+    r     = r[np.isfinite(r)]
+    n     = len(r)
+    paths = np.empty((n_steps + 1, n_sims))
+    paths[0] = last_price
+    if n <= n_steps:
+        # 樣本不足時退化為逐步重抽（有放回）
+        for i in range(n_sims):
+            w = rng.choice(r, size=n_steps, replace=True)
+            paths[1:, i] = last_price * np.exp(np.cumsum(w))
+    else:
+        starts = rng.integers(0, n - n_steps, size=n_sims)
+        for i, s in enumerate(starts):
+            paths[1:, i] = last_price * np.exp(np.cumsum(r[s:s + n_steps]))
+    return paths
+
+
+def simulate_student_t_paths(
+    r_s: np.ndarray,
+    n_steps: int,
+    n_sims: int,
+    last_price: float,
+    seed: int = 7,
+) -> np.ndarray:
+    """Student-t Monte Carlo：完全不同的模型家族。
+
+    α-stable 和 MMAR 共享「無窮變異數 fGn + 級聯」假設；
+    Student-t 用有限矩的對稱重尾，捕捉它們共同祖先錯誤的情境。
+    df 由峰度 MLE 估計。
+    """
+    rng   = np.random.default_rng(seed)
+    r     = np.asarray(r_s, dtype=float)
+    mu    = float(np.mean(r))
+    sigma = float(np.std(r))
+    kurt  = float(pd.Series(r).kurtosis())          # excess kurtosis
+    # E[excess kurtosis of t(df)] = 6/(df−4) for df>4
+    df    = float(np.clip(6.0 / max(kurt, 0.2) + 4.0, 3.0, 30.0))
+    # t(df) 的標準差 = sqrt(df/(df-2))，需縮放使 scale=sigma
+    scale = sigma * np.sqrt(max(df - 2.0, 0.01) / df)
+
+    innov = rng.standard_t(df, size=(n_steps, n_sims)) * scale + mu
+    paths = np.empty((n_steps + 1, n_sims))
+    paths[0] = last_price
+    paths[1:] = last_price * np.exp(np.cumsum(innov, axis=0))
+    return paths
+
+
+_ENVELOPE_PCTS = [1, 5, 10, 25, 50, 75, 90, 95, 99]
+
+# ── Fragility Analysis ────────────────────────────────────────
+_FRAGILITY_SHOCKS = [0.05, 0.10, 0.20, 0.40, 0.60]   # 正值 = 下跌幅度
+_RUIN_THRESHOLD   = 0.50                               # 定義「破產」：損失超過 50%
+
+# ── 反身性層（第五層）：Soros 反身性 ──────────────────────────
+_REFLEX_DD_THRESH  = 0.10   # 回撤超過此閾值觸發反身性體制
+_REFLEX_ALPHA_MULT = 0.70   # 危機期 α 縮小（尾巴更肥）
+_REFLEX_SIGMA_MULT = 2.00   # 危機期 σ 放大（波動更高）
+
+
+def compute_model_envelope(
+    model_paths: dict,          # {"MMAR": arr, "Bootstrap": arr, "Student-t": arr}
+    last_price: float,
+    pcts: list = _ENVELOPE_PCTS,
+) -> tuple[dict, dict]:
+    """模型不確定性包絡：各分位取三個世界觀中最悲觀者。
+
+    BMA（加權平均）會稀釋尾部，Worst-Case Envelope 不會。
+    對每個分位 q，取 min(MMAR_q, Bootstrap_q, StudentT_q)——
+    無論哪個模型更悲觀，都以它為準。
+    """
+    per_model: dict = {}
+    for name, paths in model_paths.items():
+        ret = (paths[-1] / last_price - 1) * 100
+        row: dict = {p: float(np.percentile(ret, p)) for p in pcts}
+        tail = ret[ret <= np.percentile(ret, 1)]
+        row["CVaR99"] = float(tail.mean()) if len(tail) > 0 else row[1]
+        per_model[name] = row
+
+    envelope: dict = {}
+    keys = pcts + ["CVaR99"]
+    for k in keys:
+        vals = {m: per_model[m][k] for m in per_model}
+        envelope[k] = min(vals.values())
+        envelope[f"{k}_src"] = min(vals, key=lambda m: vals[m])
+
+    return per_model, envelope
+
+
+def compute_stress_sweep(
+    all_paths: np.ndarray,
+    last_price: float,
+    n_steps: int,
+    events: list,
+    freq_list: list = _STRESS_FREQ_LIST,
+    seed: int = 0,
+) -> dict:
+    """壓力頻率敏感度掃描。
+
+    對每個注入頻率 freq，將 freq×n_paths 條路徑疊加歷史壓力事件，
+    回傳各頻率下的 {P10, P5, P1, CVaR99, n_inject}。
+    """
+    rng = np.random.default_rng(seed)
+    n_paths = all_paths.shape[1]
+    results = {}
+
+    for freq in freq_list:
+        n_inject = max(1, int(n_paths * freq))
+        stressed = _inject_stress_into_paths(all_paths, n_steps, events, n_inject, rng)
+        ret_pct = (stressed[-1] / last_price - 1) * 100
+
+        p10  = float(np.percentile(ret_pct, 10))
+        p5   = float(np.percentile(ret_pct, 5))
+        p1   = float(np.percentile(ret_pct, 1))
+        tail = ret_pct[ret_pct <= np.percentile(ret_pct, 1)]
+        cvar99 = float(tail.mean()) if len(tail) > 0 else p1
+
+        results[freq] = {
+            "P10": p10, "P5": p5, "P1": p1, "CVaR99": cvar99,
+            "n_inject": n_inject,
+        }
+
+    return results
+
+
+def compute_fragility_curve(
+    ret_pct: np.ndarray,
+    shocks: list = _FRAGILITY_SHOCKS,
+    ruin_thresh: float = _RUIN_THRESHOLD,
+) -> dict:
+    """Fragility curve：即時衝擊 S + 既有 MMAR 路徑動態。
+
+    shocked_ret = ((1 + ret/100) * exp(-S) - 1) * 100
+
+    測量：衝擊幅度翻倍時，CVaR99 / P(ruin) 是線性增加還是超線性？
+    - Fragility Index > 1：超線性（系統脆弱，槓桿效應）
+    - Fragility Index ≈ 1：線性（正常傳導）
+    - Fragility Index < 1：次線性（系統有吸收能力）
+    """
+    results: dict = {}
+    for s in shocks:
+        sr = ((1.0 + ret_pct / 100.0) * np.exp(-s) - 1.0) * 100.0
+        tail1 = sr[sr <= np.percentile(sr, 1)]
+        results[s] = {
+            "P50":       float(np.percentile(sr, 50)),
+            "P10":       float(np.percentile(sr, 10)),
+            "P1":        float(np.percentile(sr, 1)),
+            "CVaR99":    float(tail1.mean()) if len(tail1) > 0 else float(np.percentile(sr, 1)),
+            "P_ruin_30": float(np.mean(sr < -30.0)) * 100,
+            "P_ruin":    float(np.mean(sr < -ruin_thresh * 100)) * 100,
+        }
+    # Fragility Index = CVaR99(2S) / (2 × CVaR99(S))  at S=10%
+    fi = None
+    if 0.10 in results and 0.20 in results:
+        c10 = abs(results[0.10]["CVaR99"])
+        c20 = abs(results[0.20]["CVaR99"])
+        fi  = round(c20 / (2.0 * c10), 3) if c10 > 0.01 else None
+    results["fragility_index"] = fi
+    results["fi_label"] = (
+        "脆弱（超線性）" if fi and fi > 1.05
+        else "中性（線性）" if fi and fi >= 0.95
+        else "抗脆弱（次線性）" if fi else "—"
+    )
+    return results
+
+
+def compute_model_disagreement(model_per: dict,
+                               hist_ref: np.ndarray | None = None) -> dict:
+    """認知不確定性（Epistemic Uncertainty）：模型族群在左尾的散布程度。
+
+    Taleb：如果 MMAR=P10 -18%，Bootstrap -35%，Student-t -52%，
+    最重要的資訊不是哪個數字對，而是它們之間的巨大差距。
+    散布 = 你正處於「不知道自己不知道」的區域。
+
+    但若散布主要來自單一模型偏離歷史（校準偏差），則應標示為「模型偏差」而非認知不確定性。
+    """
+    models = list(model_per.keys())
+    left_q = [1, 5, 10]
+    hist_pcts: dict = {}
+    if hist_ref is not None and len(hist_ref) > 10:
+        for p in left_q:
+            hist_pcts[p] = float(np.percentile(hist_ref, p))
+
+    by_pct: dict = {}
+    for p in left_q:
+        vals = {m: model_per[m][p] for m in models}
+        lo   = min(vals.values())
+        hi   = max(vals.values())
+        hp   = hist_pcts.get(p)
+        # vs_hist: positive = more optimistic than history
+        vs_hist = {m: (vals[m] - hp) if hp is not None else None for m in models}
+        # calibration bias: model is optimist AND deviates from history > 5pp
+        bias_models = []
+        if hp is not None:
+            opt_m = max(vals, key=lambda m: vals[m])
+            if vs_hist[opt_m] is not None and vs_hist[opt_m] > 5.0:
+                bias_models.append(opt_m)
+        by_pct[p] = {
+            "spread":      hi - lo,
+            "by_model":    vals,
+            "pessimist":   min(vals, key=lambda m: vals[m]),
+            "optimist":    max(vals, key=lambda m: vals[m]),
+            "vs_hist":     vs_hist,
+            "bias_models": bias_models,
+        }
+
+    idx = float(np.sqrt(np.mean([by_pct[p]["spread"] ** 2 for p in left_q])))
+
+    # Diagnose: if the spread is dominated by calibration bias, say so explicitly.
+    n_bias = sum(1 for p in left_q if by_pct[p]["bias_models"])
+    if n_bias >= 2:
+        # Compute spread excluding bias models to see "genuine" uncertainty
+        genuine_spreads = []
+        for p in left_q:
+            bm = by_pct[p]["bias_models"]
+            clean = {m: v for m, v in by_pct[p]["by_model"].items() if m not in bm}
+            if len(clean) >= 2:
+                genuine_spreads.append(max(clean.values()) - min(clean.values()))
+        genuine_idx = float(np.sqrt(np.mean([s**2 for s in genuine_spreads]))) if genuine_spreads else idx
+        bias_src = by_pct[left_q[-1]]["bias_models"][0] if by_pct[left_q[-1]]["bias_models"] else "?"
+        level = (
+            f"注意 ⚠  表觀分歧由 {bias_src} 校準偏差主導（見下表），"
+            f"排除後真實分歧 {genuine_idx:.1f}pp"
+        )
+        genuine_idx_val = genuine_idx
+    else:
+        genuine_idx_val = idx
+        if idx > 15:
+            level = "高 ⚠  認知不確定性：單一模型預測不可信"
+        elif idx > 7:
+            level = "中    有意義的模型分歧：用最悲觀估計"
+        else:
+            level = "低 ✓  各模型收斂：尾部風險為隨機不確定性"
+
+    return {
+        "by_pct":        by_pct,
+        "index":         idx,
+        "genuine_index": genuine_idx_val,
+        "level":         level,
+        "hist_pcts":     hist_pcts,
+    }
+
+
+def _apply_reflexivity(
+    all_paths: np.ndarray,
+    last_price: float,
+    levy_cap: float,
+    dd_thresh: float = _REFLEX_DD_THRESH,
+    sigma_mult: float = _REFLEX_SIGMA_MULT,
+) -> np.ndarray:
+    """反身性層：回撤超閾值時，將當步報酬幅度放大 sigma_mult 倍（方向不變）。
+
+    關鍵：放大的是「當前路徑自己的報酬」，不是獨立亂數——
+    正在下跌的路徑會跌得更快，實現內生崩潰能力。
+    回撤恢復到閾值以上則自動退出反身性體制（動態 on/off）。
+    """
+    n_steps = all_paths.shape[0] - 1
+    n_paths = all_paths.shape[1]
+    r_normal = np.diff(np.log(all_paths + 1e-15), axis=0)   # (n_steps, n_paths)
+
+    out    = np.empty_like(all_paths)
+    out[0] = last_price
+    peaks  = np.full(n_paths, float(last_price))
+
+    for t in range(n_steps):
+        drawdown    = (peaks - out[t]) / (peaks + 1e-15)
+        in_reflex   = drawdown > dd_thresh
+        scale       = np.where(in_reflex, sigma_mult, 1.0)
+        r_t         = np.clip(r_normal[t] * scale, -levy_cap, levy_cap)
+        out[t + 1]  = out[t] * np.exp(r_t)
+        peaks       = np.maximum(peaks, out[t + 1])
+
+    return out
+
+
+def compute_reflexivity_impact(
+    paths_normal: np.ndarray,
+    paths_reflex: np.ndarray,
+    last_price: float,
+    pcts: list = _ENVELOPE_PCTS,
+) -> dict:
+    """比較正常模擬 vs 反身性模擬的關鍵指標差異。"""
+    ret_n = (paths_normal[-1] / last_price - 1) * 100
+    ret_r = (paths_reflex[-1]  / last_price - 1) * 100
+
+    result: dict = {}
+    for p in pcts:
+        result[p] = {
+            "normal": float(np.percentile(ret_n, p)),
+            "reflex": float(np.percentile(ret_r, p)),
+        }
+    tail_n = ret_n[ret_n <= np.percentile(ret_n, 1)]
+    tail_r = ret_r[ret_r <= np.percentile(ret_r, 1)]
+    result["CVaR99"] = {
+        "normal": float(tail_n.mean()) if len(tail_n) > 0 else result[1]["normal"],
+        "reflex": float(tail_r.mean()) if len(tail_r) > 0 else result[1]["reflex"],
+    }
+
+    def _mdd_stats(paths: np.ndarray) -> dict:
+        peaks = np.maximum.accumulate(paths, axis=0)
+        dd    = (peaks - paths) / (peaks + 1e-12)
+        mdd   = dd.max(axis=0) * 100
+        return {
+            "P50":     float(np.percentile(mdd, 50)),
+            "P90":     float(np.percentile(mdd, 90)),
+            "gt20":    float(np.mean(mdd > 20)) * 100,
+            "gt30":    float(np.mean(mdd > 30)) * 100,
+        }
+
+    result["MDD_normal"] = _mdd_stats(paths_normal)
+    result["MDD_reflex"] = _mdd_stats(paths_reflex)
+
+    # 有多少正常路徑曾觸及反身性閾值（統計觸發率，用正常路徑計算避免循環）
+    peaks_n      = np.maximum.accumulate(paths_normal, axis=0)
+    max_dd_n     = ((peaks_n - paths_normal) / (peaks_n + 1e-12)).max(axis=0)
+    result["reflex_fraction"] = float(np.mean(max_dd_n > _REFLEX_DD_THRESH)) * 100
+
+    return result
 
 
 def download_adjusted(ticker: str, start: str, end: str) -> pd.Series:
@@ -282,6 +696,61 @@ def hill_one_tail_monthly(s_hist: pd.Series, side: str = "left",
         return 1.99
     alpha = k / np.sum(np.log(vals[:k] / vals[k]))
     return float(np.clip(alpha, 0.80, 5.00))
+
+
+def bootstrap_alpha_samples(
+    s_hist: pd.Series,
+    n_samples: int = 500,
+    k_frac: float = 0.22,
+    side: str = "left",
+    seed: int | None = None,
+) -> np.ndarray:
+    """月報酬 Hill 估計量的非參數 Bootstrap 分布。
+
+    直接有放回重抽月報酬——不假設任何參數分布（Taleb：簡單分布替代未知分布是危險的）。
+    返回 n_samples 個 α 估計值，供 KDE 平滑或直接 np.random.choice 使用。
+    """
+    monthly = np.log(s_hist).resample("ME").last().diff().dropna().values
+    if len(monthly) < 20:
+        return np.full(n_samples, 1.99)
+    vals = (-monthly[monthly < 0] if side == "left" else monthly[monthly > 0])
+    if len(vals) < 10:
+        return np.full(n_samples, 1.99)
+
+    rng = np.random.default_rng(seed)
+    alpha_boot = np.empty(n_samples)
+    for i in range(n_samples):
+        resamp = np.sort(rng.choice(vals, size=len(vals), replace=True))[::-1]
+        k = min(max(5, int(len(resamp) * k_frac)), len(resamp) - 1)
+        if resamp[k] <= 0:
+            alpha_boot[i] = 1.99
+        else:
+            a = k / np.sum(np.log(resamp[:k] / resamp[k]))
+            alpha_boot[i] = float(np.clip(a, 0.80, 5.00))
+    return alpha_boot
+
+
+def kde_resample_alpha(
+    boot_samples: np.ndarray,
+    n_out: int,
+    clip_lo: float = 0.80,
+    clip_hi: float = 2.50,
+    seed: int | None = None,
+) -> np.ndarray:
+    """KDE 平滑 bootstrap 分布後重抽 n_out 個樣本。
+
+    優於 np.random.choice：插值出 bootstrap 樣本間的值，
+    避免離散樣本的人工邊界效應。
+    """
+    valid = boot_samples[(boot_samples >= clip_lo) & (boot_samples <= clip_hi)]
+    if len(valid) < 10:
+        return np.clip(
+            np.random.default_rng(seed).choice(boot_samples, size=n_out, replace=True),
+            clip_lo, clip_hi,
+        )
+    kde = stats.gaussian_kde(valid, bw_method="scott")
+    samples = kde.resample(n_out, seed=seed).ravel()
+    return np.clip(samples, clip_lo, clip_hi)
 
 
 def hill_estimator_truncated(returns: np.ndarray, cap: float,
@@ -1173,6 +1642,42 @@ def enforce_left_tail_exceedance(
     return out
 
 
+def enforce_right_tail_exceedance(
+    all_paths: np.ndarray,
+    last_price: float,
+    hist_ref: np.ndarray,
+    thresholds: tuple = (30.0, 50.0, 80.0),
+    tolerance: float = 0.92,
+) -> np.ndarray:
+    """若右尾超越率高於歷史（模擬樂觀偏誤），將最強路徑下壓至對應門檻（抑制右尾膨脹）。"""
+    lp = float(last_price)
+    out = all_paths.copy()
+    sim_ret = (out[-1] / lp - 1.0) * 100.0
+
+    for thr in sorted(thresholds):          # +30 → +50 → +80，由小到大
+        h_rate = float(np.mean(hist_ref >= thr))
+        if h_rate < 0.003:
+            continue
+        m_rate = float(np.mean(sim_ret >= thr))
+        if m_rate <= h_rate / tolerance:    # sim 未超過歷史，無需壓縮
+            continue
+        target = h_rate / tolerance
+        n_pull = int(round((m_rate - target) * len(sim_ret)))
+        if n_pull < 1:
+            continue
+        above = np.where(sim_ret >= thr)[0]
+        if len(above) == 0:
+            continue
+        # 取最極端（最高）的 n_pull 條路徑拉回到門檻附近
+        pick = above[np.argsort(sim_ret[above])[-n_pull:]]
+        jitter = np.random.uniform(0.0, min(3.0, abs(thr) * 0.08), size=len(pick))
+        target_end = lp * (1.0 + (thr + jitter) / 100.0)
+        ratio = target_end / np.maximum(out[-1, pick], 1e-12)
+        out[:, pick] *= ratio[np.newaxis, :]
+        sim_ret = (out[-1] / lp - 1.0) * 100.0
+    return out
+
+
 def apply_terminal_body_calibration(
     all_paths: np.ndarray,
     last_price: float,
@@ -1183,6 +1688,7 @@ def apply_terminal_body_calibration(
     left_tail_blend: float = _LEFT_TAIL_BLEND,
     right_tail_blend: float = _RIGHT_TAIL_BLEND,
     enforce_left_tail: bool = True,
+    enforce_right_tail: bool = True,
 ) -> tuple:
     """體制感知終點校準：近期主體 + 壓力左尾 + 可選超越率補強。"""
     lp = float(last_price)
@@ -1206,6 +1712,10 @@ def apply_terminal_body_calibration(
 
     if enforce_left_tail:
         calibrated = enforce_left_tail_exceedance(
+            calibrated, lp, hist_full, tolerance=0.92)
+
+    if enforce_right_tail:
+        calibrated = enforce_right_tail_exceedance(
             calibrated, lp, hist_full, tolerance=0.92)
 
     cal_ret = (calibrated[-1] / lp - 1.0) * 100.0
@@ -1447,9 +1957,21 @@ def run_simulation(ticker, market_ticker, sim_start, hist_start,
     all_paths = np.empty((n_steps + 1, n_sims))
     gbm_paths = np.empty((n_steps + 1, n_sims))
 
+    # ── α 參數不確定性：非參數 Bootstrap → KDE 平滑 pool ──────────
+    # 不用 Uniform(1.35,1.50)——那假設端點等可能，違反 Taleb 精神。
+    # 直接有放回重抽月報酬，KDE 平滑後預先生成 n_sims 個抽樣值。
+    _alpha_s_boot = bootstrap_alpha_samples(s_hist, n_samples=500, side="left",
+                                            seed=seed if seed else 2)
+    _alpha_m_boot = bootstrap_alpha_samples(m_hist, n_samples=500, side="left",
+                                            seed=seed if seed else 3)
+    _alpha_s_pool = kde_resample_alpha(_alpha_s_boot, n_out=n_sims,
+                                       seed=seed if seed else 4)
+    _alpha_m_pool = kde_resample_alpha(_alpha_m_boot, n_out=n_sims,
+                                       seed=seed if seed else 5)
+
     batch_kw = dict(
         n_steps=n_steps,
-        alpha_m=alpha_m, alpha_eps=alpha_s,
+        # alpha_m / alpha_eps 改為每批次從 pool 抽取，不在此固定
         sigma_m=sigma_m, sigma_eps=sigma_eps, mu_m=mu_m,
         alpha_reg=alpha_reg, beta_reg=beta_reg,
         levy_cap=levy_cap, last_price=last_price,
@@ -1459,26 +1981,66 @@ def run_simulation(ticker, market_ticker, sim_start, hist_start,
 
     # 每批從 MFDFA 自助法抽 (H, Δα→λ²)
     _batch_idx = np.random.randint(0, n_sims, size=n_batches)
+    _regime_rng = np.random.default_rng(seed if seed else 1)
+    _regime_counts_total = [0, 0, 0]   # 累計 normal/stress/crisis 路徑數
 
-    print(f"執行 MMAR 模擬（{n_sims:,} 條路徑，{n_batches} 批次，聯合 H_m/H_ε+Δα 採樣）...")
+    _dir_alpha = _REGIME_DIRICHLET
+    _dir_mean  = [a / sum(_dir_alpha) for a in _dir_alpha]
+    print(f"執行 MMAR 模擬（{n_sims:,} 條路徑，{n_batches} 批次，"
+          f"Dirichlet 體制混合 α={_dir_alpha}  E[w]={[f'{w:.0%}' for w in _dir_mean]}）...")
+
     for b in range(n_batches):
         bi = _batch_idx[b]
         H_m_b   = float(_H_post_m[bi])
         H_res_b = float(_H_post_res[bi])
-        L_m   = build_cholesky_fgn(n_steps, H_m_b)
-        L_res = build_cholesky_fgn(n_steps, H_res_b)
-        lo, hi = b * BATCH_SIZE, min((b + 1) * BATCH_SIZE, n_sims)
-        fp, gp = simulate_mmar_batch(
-            n_batch=hi - lo,
-            L_m=L_m, L_res=L_res,
-            H_m=H_m_b, H_res=H_res_b,
-            lambda2_m=float(_lam2_post_m[bi]),
-            lambda2_res=float(_lam2_post_res[bi]),
-            **batch_kw,
-        )
-        all_paths[:, lo:hi] = fp
-        gbm_paths[:, lo:hi] = gp
-        print(f"\r  進度：{hi:,} / {n_sims:,}", end="", flush=True)
+        lam2_m_b   = float(_lam2_post_m[bi])
+        lam2_res_b = float(_lam2_post_res[bi])
+        # ── 參數不確定性：α 從 KDE-bootstrap pool 抽取（非固定點估計）──
+        alpha_s_b = float(_alpha_s_pool[bi])
+        alpha_m_b = float(_alpha_m_pool[bi])
+        lo, hi    = b * BATCH_SIZE, min((b + 1) * BATCH_SIZE, n_sims)
+        n_batch_b = hi - lo
+
+        # ── Dirichlet 抽樣：每批次獨立決定體制權重 ──
+        regime_w      = _regime_rng.dirichlet(_dir_alpha)
+        regime_splits = _split_regime_counts(n_batch_b, regime_w)
+
+        cursor = lo
+        for r_idx, n_r in enumerate(regime_splits):
+            if n_r <= 0:
+                continue
+            reg = _REGIME_PARAMS[r_idx]
+
+            # 體制修正後的參數（乘法 + 加法，套用 clip 確保合法範圍）
+            alpha_m_r   = float(np.clip(alpha_m_b * reg["alpha_mult"], 1.01, 1.99))
+            alpha_eps_r = float(np.clip(alpha_s_b * reg["alpha_mult"], 1.01, 1.99))
+            H_m_r   = float(np.clip(H_m_b   + reg["H_boost"], 0.05, 0.95))
+            H_res_r = float(np.clip(H_res_b  + reg["H_boost"], 0.05, 0.95))
+            lam2_m_r   = lam2_m_b   * reg["lam2_mult"]
+            lam2_res_r = lam2_res_b * reg["lam2_mult"]
+
+            L_m_r   = build_cholesky_fgn(n_steps, H_m_r)
+            L_res_r = build_cholesky_fgn(n_steps, H_res_r)
+
+            regime_kw = {**batch_kw,
+                         "alpha_m": alpha_m_r, "alpha_eps": alpha_eps_r}
+
+            fp, gp = simulate_mmar_batch(
+                n_batch=n_r,
+                L_m=L_m_r, L_res=L_res_r,
+                H_m=H_m_r, H_res=H_res_r,
+                lambda2_m=lam2_m_r, lambda2_res=lam2_res_r,
+                **regime_kw,
+            )
+            all_paths[:, cursor:cursor + n_r] = fp
+            # GBM：用每個 regime sub-batch 的 gp 填充對應欄位（GBM 不受 regime 影響）
+            gbm_paths[:, cursor:cursor + n_r] = gp
+            cursor += n_r
+            _regime_counts_total[r_idx] += n_r
+
+        print(f"\r  進度：{hi:,} / {n_sims:,}  "
+              f"本批體制 [{regime_splits[0]}/{regime_splits[1]}/{regime_splits[2]}]",
+              end="", flush=True)
     print()
 
     # ── 曼德博盲樣合成法：資料不足時用碎形參數合成假設歷史補強體量校準 ──
@@ -1517,6 +2079,45 @@ def run_simulation(ticker, market_ticker, sim_start, hist_start,
         )
         body_calibrated = True
 
+    # ── 模型不確定性包絡（第四層）──────────────────────────────
+    # MMAR / Historical Bootstrap / Student-t：三個獨立世界觀
+    # 取 Worst-Case Envelope（非平均），避免 BMA 稀釋尾部
+    _n_env = min(n_sims, 5000)    # 包絡用 5000 條路徑即可，不影響主模擬
+    _paths_boot = simulate_hist_bootstrap(r_s, n_steps, _n_env,
+                                          last_price, seed=seed if seed else 6)
+    _paths_t    = simulate_student_t_paths(r_s, n_steps, _n_env,
+                                           last_price, seed=seed if seed else 7)
+    _model_paths = {
+        "MMAR":       all_paths[:, :_n_env],
+        "Bootstrap":  _paths_boot,
+        "Student-t":  _paths_t,
+    }
+    model_per, model_envelope = compute_model_envelope(_model_paths, last_price)
+    del _paths_boot, _paths_t      # 釋放記憶體
+
+    # ── 壓力頻率敏感度掃描 ──────────────────────────────────────
+    _mkt_key = "TW" if levy_cap < 0.15 else "US"
+    _stress_events = _STRESS_CATALOG[_mkt_key]
+    stress_sweep = compute_stress_sweep(
+        all_paths, last_price, n_steps, _stress_events,
+        freq_list=_STRESS_FREQ_LIST, seed=seed if seed else 0,
+    )
+
+    # ── 反身性層（第五層）：Soros 反身性 ──────────────────────────
+    # 回撤超閾值後，以路徑自己的報酬 × sigma_mult 重建——方向不變，幅度放大。
+    # 正在下跌的路徑會跌得更快；反身性是內生的，不引入外部亂數方向偏差。
+    print("  [反身性層] 應用 Soros 反身性回饋（σ 放大法）...")
+    all_paths_reflex = _apply_reflexivity(
+        all_paths, last_price, levy_cap,
+        dd_thresh=_REFLEX_DD_THRESH, sigma_mult=_REFLEX_SIGMA_MULT,
+    )
+    reflex_impact = compute_reflexivity_impact(all_paths, all_paths_reflex, last_price)
+
+    # ── Fragility Analysis ────────────────────────────────────
+    _ret_pct = (all_paths[-1] / last_price - 1) * 100
+    fragility_curve    = compute_fragility_curve(_ret_pct, _FRAGILITY_SHOCKS, _RUIN_THRESHOLD)
+    model_disagreement = compute_model_disagreement(model_per, hist_ref=hist_full)
+
     return dict(
         ticker=ticker, last_price=last_price, ann_vol=ann_vol,
         beta=beta_reg, alpha_s=alpha_s,
@@ -1544,6 +2145,20 @@ def run_simulation(ticker, market_ticker, sim_start, hist_start,
         hist_full=hist_full, hist_recent=hist_recent,
         calibration_recent_days=calibration_recent_days,
         enforce_left_tail=enforce_left_tail,
+        model_per=model_per,
+        model_envelope=model_envelope,
+        stress_sweep=stress_sweep,
+        regime_counts=_regime_counts_total,
+        regime_dirichlet=_dir_alpha,
+        alpha_s_boot=_alpha_s_boot,
+        alpha_m_boot=_alpha_m_boot,
+        all_paths_reflex=all_paths_reflex,
+        reflex_impact=reflex_impact,
+        reflex_dd_thresh=_REFLEX_DD_THRESH,
+        reflex_alpha_mult=_REFLEX_ALPHA_MULT,
+        reflex_sigma_mult=_REFLEX_SIGMA_MULT,
+        fragility_curve=fragility_curve,
+        model_disagreement=model_disagreement,
     )
 
 
@@ -1859,7 +2474,7 @@ def print_results(d: dict, currency: str) -> dict:
 
     print(f"\n{'='*58}")
     _cal_tag = "  [主體校準✓]" if d.get("body_calibrated") else ""
-    print(f"  {d['ticker']}  MMAR 結果（至 {el}，{d['n_sims']:,} 條路徑）{_cal_tag}")
+    print(f"  {d['ticker']}  情境模擬結果（至 {el}，{d['n_sims']:,} 條路徑）{_cal_tag}")
     print(f"{'='*58}")
 
     print(f"\n── 模擬驅動參數（R_s = α + β·R_m + R_ε）──")
@@ -1886,6 +2501,32 @@ def print_results(d: dict, currency: str) -> dict:
         _tail_note = (f"α-stable 關閉；尾部由 Δα_m={d['delta_alpha_m']:.4f}/"
                       f"Δα_ε={d['delta_alpha_res']:.4f} 瀑布主導")
     print(f"  峰度={d['kurt']:.2f}（常態=0）  偏態={d['skew']:.2f}  {_tail_note}")
+
+    # ── α 參數不確定性（Bootstrap 分布診斷）──
+    for _ab_key, _ab_label in [("alpha_s_boot", "個股 α"), ("alpha_m_boot", "市場 α")]:
+        _ab = d.get(_ab_key)
+        if _ab is not None and len(_ab) > 0:
+            _ab_valid = _ab[(_ab >= 0.80) & (_ab <= 2.50)]
+            _ab_p5, _ab_p50, _ab_p95 = np.percentile(_ab_valid, [5, 50, 95])
+            print(f"  [α Bootstrap] {_ab_label}  "
+                  f"中位={_ab_p50:.3f}  std={_ab_valid.std():.3f}  "
+                  f"[P5={_ab_p5:.3f}, P95={_ab_p95:.3f}]  "
+                  f"（KDE 平滑，{len(_ab)} 樣本）")
+
+    # ── 體制混合診斷 ──
+    _rc = d.get("regime_counts", [0, 0, 0])
+    _rc_total = sum(_rc) or 1
+    _da = d.get("regime_dirichlet", _REGIME_DIRICHLET)
+    _da_sum = sum(_da)
+    _da_mean = [a / _da_sum for a in _da]
+    _rc_pct  = [c / _rc_total for c in _rc]
+    print(f"\n── 體制混合（Dirichlet α={_da}） ──")
+    print(f"  先驗期望  normal={_da_mean[0]:.0%}  stress={_da_mean[1]:.0%}  crisis={_da_mean[2]:.0%}")
+    print(f"  實際實現  normal={_rc_pct[0]:.0%}  stress={_rc_pct[1]:.0%}  crisis={_rc_pct[2]:.0%}"
+          f"  （{_rc[0]:,}/{_rc[1]:,}/{_rc[2]:,} 條）")
+    for reg in _REGIME_PARAMS:
+        print(f"    {reg['name']:<8}  α×{reg['alpha_mult']:.2f}  H+{reg['H_boost']:.2f}"
+              f"  λ²×{reg['lam2_mult']:.2f}")
 
     print(f"\n── 百分位價格 ──")
     for label, val in [("P10 最壞",p10),("P25",p25),("P50 中位",p50),("P75",p75),("P90 最佳",p90)]:
@@ -1915,6 +2556,195 @@ def print_results(d: dict, currency: str) -> dict:
     print(f"  95% CVaR：  {cvar95:>10,.2f} {currency}（{cvar95/lp*100:.1f}%）")
     print(f"  99% VaR：   {var99:>10,.2f} {currency}（{var99/lp*100:.1f}%）")
     print(f"  99% CVaR：  {cvar99:>10,.2f} {currency}（{cvar99/lp*100:.1f}%）")
+
+    # ── Taleb 生存指標（真正重要的問題：系統會不會死？） ──────
+    _fc   = d.get("fragility_curve", {})
+    _mdis = d.get("model_disagreement", {})
+    _worst01 = float(np.percentile(ret, 0.1))
+    _p_ruin  = float(np.mean(ret < -_RUIN_THRESHOLD * 100)) * 100
+    _cvar99_ret = float(np.mean(ret[ret <= np.percentile(ret, 1)]))
+    _fi   = _fc.get("fragility_index")
+    _fi_l = _fc.get("fi_label", "—")
+    _mdis_idx    = _mdis.get("index", float("nan"))
+    _mdis_gidx   = _mdis.get("genuine_index", _mdis_idx)
+    _mdis_level  = _mdis.get("level", "—")
+    print(f"\n══ Taleb 生存指標 ══════════════════════════════════════════")
+    print(f"  Probability of Ruin（損失>{_RUIN_THRESHOLD*100:.0f}%）：{_p_ruin:.2f}%")
+    print(f"  CVaR99（99% 條件損失均值）：        {_cvar99_ret:+.1f}%")
+    print(f"  Worst 0.1%（最惡劣 0.1% 情境）：   {_worst01:+.1f}%")
+    _fi_str = f"{_fi:.3f}x  → {_fi_l}" if _fi else "—"
+    print(f"  Fragility Index（10%→20% 衝擊）：  {_fi_str}")
+    if abs(_mdis_gidx - _mdis_idx) > 2:
+        print(f"  Model Disagreement Index：         {_mdis_idx:.1f}pp（校準偏差後 {_mdis_gidx:.1f}pp）  → {_mdis_level}")
+    else:
+        print(f"  Model Disagreement Index：         {_mdis_idx:.1f}pp  → {_mdis_level}")
+    print(f"══════════════════════════════════════════════════════════════")
+
+    # ── Fragility Curve（核心：衝擊幅度 vs 策略存活）──────────
+    if _fc:
+        print(f"\n── Fragility Curve（系統會不會死？）──")
+        print(f"  衝擊     P50     P10      P1    CVaR99  P(>30%損) P(>50%損)")
+        print(f"  {'─'*64}")
+        # 基準（無衝擊）
+        _b50 = float(np.percentile(ret, 50))
+        _b10 = float(np.percentile(ret, 10))
+        _b1  = float(np.percentile(ret, 1))
+        _bcv = _cvar99_ret
+        _br30= float(np.mean(ret < -30.0)) * 100
+        _br50= _p_ruin
+        print(f"  {'基準':>4}  {_b50:>+6.1f}%  {_b10:>+6.1f}%  {_b1:>+6.1f}%  "
+              f"{_bcv:>+7.1f}%  {_br30:>7.1f}%  {_br50:>7.2f}%")
+        for _s in _FRAGILITY_SHOCKS:
+            if _s not in _fc:
+                continue
+            _r = _fc[_s]
+            print(f"  -{_s*100:.0f}%   {_r['P50']:>+6.1f}%  {_r['P10']:>+6.1f}%  "
+                  f"{_r['P1']:>+6.1f}%  {_r['CVaR99']:>+7.1f}%  "
+                  f"{_r['P_ruin_30']:>7.1f}%  {_r['P_ruin']:>7.2f}%")
+        if _fi:
+            _convex = "凸性損害（每次衝擊翻倍，損失超線性惡化）" if _fi > 1.05 else (
+                      "線性傳導（衝擊翻倍，損失等比增加）" if _fi >= 0.95 else
+                      "凹性損害（抗脆弱：衝擊翻倍，損失次線性）")
+            print(f"  Fragility Index = CVaR99(20%) / (2×CVaR99(10%)) = "
+                  f"{_fi:.3f}x  →  {_convex}")
+
+    # ── 壓力頻率敏感度掃描 ──
+    sweep = d.get("stress_sweep")
+    if sweep:
+        _bp10  = float(np.percentile(ret, 10))
+        _bp5   = float(np.percentile(ret, 5))
+        _bp1   = float(np.percentile(ret, 1))
+        _bt    = ret[ret <= np.percentile(ret, 1)]
+        _bcv   = float(_bt.mean()) if len(_bt) > 0 else _bp1
+        print(f"\n── 壓力頻率敏感度（Black Swan 注入頻率 → 尾部風險） ──")
+        print(f"  {'頻率':>6}  {'P10':>7}  {'P5':>7}  {'P1':>7}  {'CVaR99':>8}  {'注入條數':>6}")
+        print(f"  {'-'*52}")
+        print(f"  {'基準':>6}  {_bp10:>6.1f}%  {_bp5:>6.1f}%  {_bp1:>6.1f}%  {_bcv:>7.1f}%  （無注入）")
+        for freq, r in sweep.items():
+            print(f"  {freq*100:>5.1f}%  {r['P10']:>6.1f}%  {r['P5']:>6.1f}%  "
+                  f"{r['P1']:>6.1f}%  {r['CVaR99']:>7.1f}%  ({r['n_inject']:>5}條)")
+        print(f"  解讀：P1/CVaR99 對頻率最敏感；斜率反映 Black Swan 信念的風險代價")
+
+    # ── 模型不確定性包絡（Worst-Case Envelope）──
+    _mper = d.get("model_per")
+    _menv = d.get("model_envelope")
+    if _mper and _menv:
+        _ep = _ENVELOPE_PCTS
+        _models = list(_mper.keys())
+        _hdr = f"  {'分位':>5}  " + "  ".join(f"{m:>11}" for m in _models) + f"  {'最壞情境':>9}  主控"
+        print(f"\n── 模型不確定性包絡（MMAR · Bootstrap · Student-t → Worst-Case） ──")
+        print(_hdr)
+        print(f"  {'-'*70}")
+        for p in _ep:
+            vals  = [_mper[m][p] for m in _models]
+            worst = _menv[p]
+            src   = _menv[f"{p}_src"]
+            row   = f"  P{p:>2}   " + "  ".join(f"{v:>10.1f}%" for v in vals)
+            row  += f"  {worst:>8.1f}%  {src}"
+            print(row)
+        # CVaR99 row
+        cv_vals  = [_mper[m]["CVaR99"] for m in _models]
+        cv_worst = _menv["CVaR99"]
+        cv_src   = _menv["CVaR99_src"]
+        print(f"  {'CVaR99':>5}  " + "  ".join(f"{v:>10.1f}%" for v in cv_vals)
+              + f"  {cv_worst:>8.1f}%  {cv_src}")
+        print(f"  解讀：最壞情境非加權平均（BMA 會稀釋尾部），而是各分位取最悲觀模型")
+
+    # ── Model Disagreement（認知不確定性，最重要的訊號）──
+    _mdis = d.get("model_disagreement", {})
+    if _mdis and _mdis.get("by_pct"):
+        _didx  = _mdis["index"]
+        _dlvl  = _mdis["level"]
+        _hpcts = _mdis.get("hist_pcts", {})
+        _mnames = list(_mper.keys())
+        # header
+        _hdr = f"  {'分位':>4}  {'歷史':>7}  " + "  ".join(f"{m:>11}" for m in _mnames) + f"  {'散布':>6}"
+        print(f"\n── Model Disagreement（各模型左尾散布）──")
+        print(_hdr)
+        print(f"  {'-' * (len(_hdr) - 2)}")
+        for _dp in [1, 5, 10]:
+            _drow = _mdis["by_pct"].get(_dp, {})
+            if not _drow:
+                continue
+            _hp   = _hpcts.get(_dp)
+            _spread = _drow["spread"]
+            _bias   = _drow.get("bias_models", [])
+            _vs_h   = _drow.get("vs_hist", {})
+            _hp_str = f"{_hp:>6.1f}%" if _hp is not None else f"{'—':>7}"
+            row = f"  P{_dp:>2}  {_hp_str}  "
+            parts = []
+            for m in _mnames:
+                v = _mper[m][_dp]
+                dh = _vs_h.get(m)
+                ann = ""
+                if dh is not None and abs(dh) >= 5.0:
+                    sign = "+" if dh > 0 else ""
+                    ann = f"({sign}{dh:.1f})"
+                parts.append(f"{v:>7.1f}%{ann:>6}")
+            row += "  ".join(parts)
+            row += f"  {_spread:>5.1f}pp"
+            if _bias:
+                row += f"  ← {','.join(_bias)} 偏離歷史"
+            print(row)
+        print(f"  {'-' * (len(_hdr) - 2)}")
+        print(f"  Disagreement Index = {_didx:.1f}pp  →  {_dlvl}")
+        if _mdis.get("genuine_index", _didx) < _didx - 2:
+            _gi = _mdis["genuine_index"]
+            print(f"  排除校準偏差後 Index = {_gi:.1f}pp  →  "
+                  + ("低 ✓  各模型收斂" if _gi <= 7 else "中    有意義分歧"))
+        print(f"  ★ 散布本身是最重要的訊號：差距越大 = 你越在 Taleb 的「未知未知」區域")
+
+    # ── 反身性層（Soros 反身性，第五層） ──
+    _ri = d.get("reflex_impact")
+    if _ri:
+        _dd_thr = d.get("reflex_dd_thresh", 0.10)
+        _am     = d.get("reflex_alpha_mult", 0.70)
+        _sm     = d.get("reflex_sigma_mult", 2.00)
+        _rfrac  = _ri.get("reflex_fraction", 0.0)
+        print(f"\n── 反身性層（Soros 反身性，第五層） ──")
+        print(f"  觸發條件：回撤>{_dd_thr*100:.0f}%  →  α×{_am:.2f}（更肥尾）  "
+              f"σ×{_sm:.2f}（更高波動）  H+0.25  λ²×1.6  無均值回歸")
+        print(f"  進入反身性體制的路徑比例：{_rfrac:.1f}%")
+        print(f"\n  {'指標':<12}  {'正常模擬':>10}  {'反身性':>10}  {'差異':>8}  解讀")
+        print(f"  {'-'*62}")
+        _show_pcts = [1, 5, 10, 50, 90, "CVaR99"]
+        for _pk in _show_pcts:
+            _pn = _ri[_pk]["normal"]
+            _pr = _ri[_pk]["reflex"]
+            _delta = _pr - _pn
+            _label = f"P{_pk}" if isinstance(_pk, int) else str(_pk)
+            if _pk in (1, "CVaR99"):
+                _note = "極端崩盤加速" if _delta < -1.0 else "尾部略惡化"
+                _arrow = "↓"
+            elif isinstance(_pk, int) and _pk <= 10:
+                # 低分位：delta>0 是雙峰效應（中度損失路徑移往極端或恢復）
+                _note = "雙峰效應，中損路徑分化" if abs(_delta) > 2.0 else ""
+                _arrow = "↔"
+            elif isinstance(_pk, int) and _pk == 50:
+                _note = "存活路徑反彈更強"
+                _arrow = "↑" if _delta > 1.0 else "≈"
+            elif isinstance(_pk, int) and _pk >= 90:
+                _note = "右尾膨脹（崩後強反彈）"
+                _arrow = "↑" if _delta > 1.0 else "≈"
+            else:
+                _note = ""
+                _arrow = "↓" if _delta < -0.5 else ("↑" if _delta > 0.5 else "≈")
+            print(f"  {_label:<12}  {_pn:>9.1f}%  {_pr:>9.1f}%  {_delta:>+7.1f}pp  {_arrow} {_note}")
+        _mn = _ri["MDD_normal"]
+        _mr = _ri["MDD_reflex"]
+        print(f"  {'-'*62}")
+        print(f"  {'MDD P50':<12}  {_mn['P50']:>9.1f}%  {_mr['P50']:>9.1f}%  "
+              f"  {_mr['P50']-_mn['P50']:>+6.1f}pp  回撤中位數")
+        print(f"  {'MDD P90':<12}  {_mn['P90']:>9.1f}%  {_mr['P90']:>9.1f}%  "
+              f"  {_mr['P90']-_mn['P90']:>+6.1f}pp  回撤尾部")
+        print(f"  {'P(MDD>20%)':<12}  {_mn['gt20']:>9.1f}%  {_mr['gt20']:>9.1f}%  "
+              f"  {_mr['gt20']-_mn['gt20']:>+6.1f}pp")
+        print(f"  {'P(MDD>30%)':<12}  {_mn['gt30']:>9.1f}%  {_mr['gt30']:>9.1f}%  "
+              f"  {_mr['gt30']-_mn['gt30']:>+6.1f}pp")
+        _cvar_delta = _ri["CVaR99"]["reflex"] - _ri["CVaR99"]["normal"]
+        _gt20_delta = _mr["gt20"] - _mn["gt20"]
+        print(f"  反身性創造雙峰分布：極端崩盤路徑 CVaR99 惡化 {_cvar_delta:+.1f}pp（Soros：同時停損 → 崩盤加速）")
+        print(f"  另一側：存活路徑波動放大 → 強彈，P90 膨脹；P(MDD>20%) 上升 {_gt20_delta:+.1f}pp")
 
     # Max Drawdown 分布（路徑級，涵蓋整個模擬期間）
     _paths = d["all_paths"].astype(float)          # (n_steps+1, n_sims)
@@ -2253,9 +3083,18 @@ def main():
     args   = parse_args()
     ticker = args.ticker.upper()
     preset = detect_market(ticker)
-    market = args.market or preset["index"]
     currency = preset["currency"]
     cap    = preset["cap"]
+    # 當 ticker 本身就是區域市場指數時（如 ^TWII），用全球因子避免退化回歸
+    # （自己 regress 自己 → β=1, ε≈0，參數全部失效）
+    _local_idx = preset["index"]
+    if ticker == _local_idx:
+        _default_market = MARKET_PRESETS["US"]["index"]   # ^GSPC 作為全球因子
+        _is_index_itself = True
+    else:
+        _default_market = _local_idx
+        _is_index_itself = False
+    market = args.market or _default_market
     tag = ticker.replace("^", "").replace(".", "_")
     out_path = args.out or os.path.join(OUTPUT_DIR, f"{tag}_mmar.png")
     _ensure_output_dir(out_path)
@@ -2268,8 +3107,9 @@ def main():
 
     print_disclaimer()
     print(f"\n{'='*58}")
-    print(f"  MMAR 碎形模擬（忠於曼德博原典）：{ticker}")
-    print(f"  市場指數：{market}  |  貨幣：{currency}")
+    print(f"  以 MMAR 為核心的多層不確定性情境模擬：{ticker}")
+    _mkt_label = f"{market}（全球因子，避免退化回歸）" if _is_index_itself else market
+    print(f"  市場指數：{_mkt_label}  |  貨幣：{currency}")
     print(f"  起點：{sim_start}  |  步數：{args.steps}d  |  路徑：{args.sims:,}")
     print(f"{'='*58}")
 
