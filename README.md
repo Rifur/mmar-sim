@@ -2,7 +2,7 @@
 
 [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/Rifur/mmar-sim/blob/main/mmar_colab.ipynb)
 
-**MMAR multifractal market simulator** — Monte Carlo price paths with heavy tails, volatility clustering, long memory, goodness-of-fit validation, and risk scenario tables for Taiwan & US equities.
+**MMAR multifractal market simulator** — Monte Carlo price paths with heavy tails, volatility clustering, regime mixing, multi-model tail risk, goodness-of-fit validation, and scenario tables for Taiwan & US equities.
 
 ## Disclaimer / 免責聲明
 
@@ -15,16 +15,21 @@ See **[DISCLAIMER.md](DISCLAIMER.md)** for the full text (中文 / English).
 
 | Layer | Method |
 |-------|--------|
-| Heavy tails | α-stable sub-Gaussian (CMS), Hill / truncated MLE, monthly α |
+| Heavy tails | α-stable sub-Gaussian (CMS); Hill / truncated MLE; monthly α; **α bootstrap + KDE pool** per path |
 | Long memory | MFDFA h(2) → fGn (Cholesky); R/S Hurst reported for diagnostics only |
 | Multifractal | MFDFA singularity width → lognormal MMAR cascade |
-| Regime | Bayesian α shrinkage, crisis dynamic H, HAR-RV + GJR |
-| Asymmetry | Monthly one-tail Hill (Taleb-inspired); GJR down-day vol ×1.5; left-tail calibration |
-| Calibration | Recent-window body anchor, stress left-tail pool, synthetic paths when history is short |
+| Regime | **Dirichlet mixture** (normal / stress / crisis); Bayesian α shrinkage; crisis dynamic H; HAR-RV + GJR |
+| Asymmetry | Monthly one-tail Hill (Taleb-inspired); GJR down-day vol ×1.5; **symmetric tail calibration** (left & right) |
+| Calibration | Recent-window body anchor; stress left-tail pool; synthetic paths when history is short |
+| Multi-model | **Historical bootstrap** + **Student-t** + MMAR → **worst-case envelope**; model disagreement index |
+| Stress | **Black Swan event catalog** (TW/US); frequency sweep (0.1%–10% injection) |
+| Survival | **Fragility curve**; probability of ruin; CVaR99; reflexivity (Soros) impact |
 | Validation | KS test, Q-Q plots, percentile MAE, exceedance rates |
 | Scenarios | Pullback entry, spot buy, VaR/CVaR, dense-zone bands |
 
-Supports **TW** tickers (e.g. `2330.TW`, `0050.TW`) with daily price-limit handling, and **US** tickers (e.g. `NVDA`, `MU`).
+Supports **TW** tickers (e.g. `2330.TW`, `0050.TW`, `^TWII`) with daily price-limit handling, and **US** tickers (e.g. `NVDA`, `MU`).
+
+Each run prints a **full text report** before charts: parameter estimates, regime mix, percentiles, scenario tables, Taleb survival metrics, fragility curve, stress-frequency sweep, worst-case model envelope, model disagreement, and GOF.
 
 ## Quick start (local)
 
@@ -79,7 +84,7 @@ uv run real_fractal_sim.py TICKER [options]
 2. **Runtime → Run all**
 3. In **Step 2**, edit `TICKER`, `N_STEPS`, and `N_SIMS`
 
-`run_colab()` prints the **full text report** (percentiles, scenario tables, VaR, GOF) and then shows both charts. Scroll up in the output cell to read the report.
+`run_colab()` prints the **full text report** (regime mix, survival metrics, model envelope, scenarios, GOF) and then shows both charts. Scroll up in the output cell to read the report.
 
 ```python
 from real_fractal_sim_colab import run_colab
@@ -119,6 +124,8 @@ run_colab("NVDA", n_sims=3000)
 
 ## Model overview
 
+### Core MMAR generator (layers 1–3)
+
 Single-factor MMAR return (market or residual leg):
 
 ```
@@ -133,6 +140,8 @@ Stock returns: `R_s = α + β·R_m + R_ε` — two-factor model with joint block
 
 **Long memory:** Simulation uses MFDFA h(2) (with crisis H boost when triggered). Classical R/S Hurst is computed and printed for cross-check only; it does not drive the generator.
 
+**Regime mixture:** Each batch draws Dirichlet weights over normal / stress / crisis regimes (prior `[7,2,1]` → ~70% / 20% / 10%). Crisis paths scale α down, H up, and cascade λ² up. Tail index α is drawn from a monthly bootstrap → KDE pool, not a single point estimate.
+
 ### Downside–upside asymmetry (Taleb-inspired)
 
 Losses can be heavier-tailed than gains. The path generator uses **symmetric** α-stable mixing; asymmetry is layered through estimation, volatility forecasting, and calibration:
@@ -140,17 +149,34 @@ Losses can be heavier-tailed than gains. The path generator uses **symmetric** �
 - **Monthly one-tail Hill** on left vs right monthly returns (daily returns are distorted by TW price limits)
 - If the left tail is materially heavier (`α_left < α_right`, gap > 0.15), the residual tail index `α_ε` may be tightened — only when that makes the estimate more conservative
 - **HAR-RV + GJR:** down-day realized volatility weighted ×1.5 in the vol forecast
-- **Post-simulation calibration:** left tail anchored more strongly (P1/P5 blend 90%) than the right (P95/P99 blend 35%), stress-window left-tail pool, optional left-tail exceedance enforcement
+- **Post-simulation calibration:** left tail anchored at blend 90% (P1/P5), right tail at blend 80% (P95/P99), stress-window left-tail pool, optional left- and right-tail exceedance enforcement
+
+### Multi-model risk layer (layers 4–5)
+
+After MMAR paths are generated and calibrated, the report adds independent tail-risk views:
+
+| Component | Role |
+|-----------|------|
+| **Historical bootstrap** | Non-parametric rolling-window resampling — no model assumptions |
+| **Student-t Monte Carlo** | Finite-moment heavy tail; df from excess kurtosis |
+| **Worst-case envelope** | At each percentile, take the **most pessimistic** of MMAR / Bootstrap / Student-t (not a weighted average) |
+| **Model disagreement** | Spread across models on the left tail — epistemic uncertainty vs calibration bias |
+| **Stress catalog** | TW/US historical crash events injected at configurable frequencies |
+| **Fragility curve** | Instant shock (5%–60%) applied to terminal returns; fragility index measures convexity of losses |
+| **Reflexivity** | Soros-style feedback: drawdown > 10% amplifies path returns ×2 until recovery |
+
+**Taleb survival metrics** in the report: probability of ruin (>50% loss), CVaR99, worst 0.1%, fragility index, and model disagreement level.
 
 ### Pure theory vs. this implementation
 
 The generator follows Calvet–Fisher MMAR structure, but outputs are also shaped by:
 
 - Terminal body percentile anchoring to recent history
-- Stress left-tail windows and left-tail exceedance enforcement
+- Stress left-tail windows and left/right-tail exceedance enforcement
 - Synthetic terminal paths blended in when individual-stock history is short (Bayesian α shrinkage)
+- Regime mixture, multi-model envelope, stress injection sweep, and reflexivity overlay
 
-Use `--no-body-calibrate` and `--no-left-tail-enforce` to inspect closer-to-raw generator output.
+Use `--no-body-calibrate` and `--no-left-tail-enforce` to inspect closer-to-raw generator output. The multi-model envelope and stress sweep are diagnostic layers on top of the primary MMAR paths.
 
 ## Project layout
 
@@ -171,7 +197,8 @@ mmar-sim/
 - Calvet & Fisher (1997, 2002) — MMAR / multifractal volatility
 - Kantelhardt et al. (2002) — MFDFA
 - Chambers, Mallows & Stuck (1976) — α-stable sampling (CMS)
-- Taleb — fat tails and downside–upside asymmetry (monthly one-tail diagnostics)
+- Taleb — fat tails, asymmetry, fragility, and model disagreement
+- Soros — reflexivity and feedback in market dynamics
 
 ## License
 
